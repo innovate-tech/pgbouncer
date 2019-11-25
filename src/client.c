@@ -795,6 +795,11 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 {
 	SBuf *sbuf = &client->sbuf;
 	int rfq_delta = 0;
+	char *pkt_start;
+	char *query_str;
+	char *dbname;
+	PgDatabase *db;
+	PgPool *pool;
 
 	switch (pkt->type) {
 
@@ -859,6 +864,52 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 	if (client->pool->db->admin)
 		return admin_handle_client(client, pkt);
+
+	// patch for using RDS read replica
+	pkt_start = (char *) &sbuf->io->buf[sbuf->io->parse_pos];
+	/* printHex(pkt_start, pkt->len); */
+
+	if (pkt->type == 'Q') {
+		query_str = (char *) pkt_start + 5;
+	} else if (pkt->type == 'P') {
+		char *stmt_str = pkt_start + 5;
+		query_str = stmt_str + strlen(stmt_str) + 1;
+	} else {
+		fatal("Invalid packet type - expected Q or P, got %c", pkt->type);
+	}
+
+	char select_query[6];
+	for(int i = 0; i < 6; i++){
+		select_query[i] = tolower(query_str[i]);
+	}
+
+	char *match = strstr(select_query, "select");
+	dbname = match == select_query ? "rreplica" : "master";
+
+	db = find_database(dbname);
+	if (db == NULL) {
+		slog_error(client, "nonexistant database key <%s>, check ini", dbname);
+		free(dbname);
+		return false;
+	}
+
+	pool = get_pool(db, client->auth_user);
+	if (client->pool != pool) {
+		if (client->link != NULL) {
+			/* release existing server connection back to pool */
+			slog_debug(client, "releasing existing server connection");
+			release_server(client->link);
+			client->link = NULL;
+		}
+		/* assign client to new pool */
+		slog_debug(client,
+				"assigning client to connection pool for database <%s>",
+				dbname);
+		client->pool = pool;
+	} else {
+		slog_debug(client, "already connected to pool <%s>", dbname);
+	}
+	free(dbname);
 
 	/* acquire server */
 	if (!find_server(client))
